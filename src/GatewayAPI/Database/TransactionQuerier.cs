@@ -63,12 +63,15 @@
  */
 
 using Common.Database.Models.Ledger;
+using Common.Database.Models.Ledger.Joins;
 using Common.Database.Models.Mempool;
 using Common.Extensions;
 using Common.Numerics;
 using GatewayAPI.ApiSurface;
+using GatewayAPI.Exceptions;
 using GatewayAPI.Services;
 using Microsoft.EntityFrameworkCore;
+using System.Linq.Expressions;
 using System.Runtime.Serialization;
 using Gateway = RadixGatewayApi.Generated.Model;
 
@@ -79,6 +82,11 @@ public interface ITransactionQuerier
     Task<TransactionPageWithoutTotal> GetRecentUserTransactions(RecentTransactionPageRequest request, Gateway.LedgerState ledgerState);
 
     Task<TransactionPageWithTotal> GetAccountTransactions(AccountTransactionPageRequest request, Gateway.LedgerState ledgerState);
+
+    Task<BatchAccountTransactions> GetAccountTransactionsBatch(
+        List<Tuple<ValidatedAccountAddress, ValidatedTransactionIdentifier?>> request, Gateway.LedgerState ledgerState, int limit);
+
+    Task<BatchAccountTransactions> GetAccountTransactionsBatch(TransactionsBatchPageRequest request, Gateway.LedgerState ledgerState);
 
     Task<Gateway.TransactionInfo?> LookupCommittedTransaction(
         ValidatedTransactionIdentifier transactionIdentifier,
@@ -113,6 +121,11 @@ public record TransactionPageWithTotal(
     List<Gateway.TransactionInfo> Transactions
 );
 
+public record BatchAccountTransactions(
+    List<Gateway.AccountTransactionInfo> Transactions,
+    CommittedTransactionPaginationCursor? NextPageCursor
+);
+
 public record TransactionPageWithoutTotal(
     CommittedTransactionPaginationCursor? NextPageCursor,
     List<Gateway.TransactionInfo> Transactions
@@ -123,6 +136,32 @@ public record AccountTransactionPageRequest(
     CommittedTransactionPaginationCursor? Cursor,
     int PageSize
 );
+
+public record TransactionsBatchPageRequest(
+    List<ValidatedAccountAddress> AccountAddresses,
+    CommittedTransactionPaginationCursor? Cursor,
+    Gateway.LedgerState? SinceState,
+    int PageSize
+);
+
+public class TransactionVersionData
+{
+    public long ResultantStateVersion { get; set; }
+
+    public byte[] HashBytes { get; set; }
+}
+
+public class QueryResult<T1, T2>
+{
+    public T1 t1;
+    public T2 t2;
+
+    public QueryResult(T1 t1, T2 t2)
+    {
+        this.t1 = t1;
+        this.t2 = t2;
+    }
+}
 
 public record RecentTransactionPageRequest(
     CommittedTransactionPaginationCursor? Cursor,
@@ -176,6 +215,137 @@ public class TransactionQuerier : ITransactionQuerier
         );
 
         return new TransactionPageWithTotal(totalCount, nextCursor, transactions);
+    }
+
+    public async Task<BatchAccountTransactions> GetAccountTransactionsBatch(
+        List<Tuple<ValidatedAccountAddress, ValidatedTransactionIdentifier?>> request, Gateway.LedgerState ledgerState, int limit)
+    {
+        List<byte[]> transactionHashes = new List<byte[]>();
+        foreach (var req in request)
+        {
+            if (req.Item2 != null)
+            {
+                transactionHashes.Add(req.Item2.Bytes);
+            }
+        }
+
+        var oldStateVersions = await _dbContext.LedgerTransactions
+            .Where(lt =>
+                lt.ResultantStateVersion <= ledgerState._Version
+                && transactionHashes.Contains(lt.TransactionIdentifierHash)
+            )
+            .Select(lt => new TransactionVersionData { ResultantStateVersion = lt.ResultantStateVersion, HashBytes = lt.TransactionIdentifierHash})
+            .ToListAsync();
+
+        Dictionary<string, long> oldStateVersionsDict = new Dictionary<string, long>();
+        foreach (var data in oldStateVersions)
+        {
+            oldStateVersionsDict[data.HashBytes.ToHex()] = data.ResultantStateVersion;
+        }
+
+        Expression<Func<AccountTransaction, bool>>? whereExpression = null;
+        foreach (var tuple in request)
+        {
+            string address = tuple.Item1.Address;
+            var oldTxVersion = 0L;
+            if (tuple.Item2 != null)
+            {
+                var txHash = tuple.Item2.Bytes.ToHex();
+                oldTxVersion = oldStateVersionsDict.GetValueOrDefault(txHash, 0);
+                if (oldTxVersion == 0L)
+                {
+                    throw new TransactionNotFoundException(new Gateway.TransactionIdentifier(txHash));
+                }
+            }
+
+            Expression<Func<AccountTransaction, bool>> andExpression =
+                at => at.Account.Address == address && at.ResultantStateVersion > oldTxVersion;
+            whereExpression = whereExpression == null ? andExpression : whereExpression.Or(andExpression);
+        }
+
+        var ledgerTransactionVersions = await _dbContext.AccountTransactions
+            .Where(at =>
+                at.ResultantStateVersion <= ledgerState._Version
+                && !at.LedgerTransaction.IsStartOfEpoch
+            ).Where(whereExpression!)
+            .OrderBy(at => at.ResultantStateVersion)
+            .ThenBy(at => at.Account.Address)
+            .Take(limit + 1)
+            .Select(at => new QueryResult<long, string>(at.ResultantStateVersion, at.Account.Address))
+            .ToListAsync();
+
+        Dictionary<long, IEnumerable<string>> versionAccounts = new Dictionary<long, IEnumerable<string>>();
+        CommittedTransactionPaginationCursor? nextPage = null;
+        for (int i = 0; i < ledgerTransactionVersions.Count; i++)
+        {
+            if (i == limit)
+            {
+                nextPage = new CommittedTransactionPaginationCursor(ledgerTransactionVersions[i - 1].t1);
+                break;
+            }
+
+            var ledgerTransactionV = ledgerTransactionVersions[i];
+            bool exists = versionAccounts.TryGetValue(ledgerTransactionV.t1, out var involvedAccounts);
+            if (!exists)
+            {
+                involvedAccounts = new List<string>();
+                versionAccounts.Add(ledgerTransactionV.t1, involvedAccounts);
+            }
+
+            ((List<string>)involvedAccounts!).Add(ledgerTransactionV.t2);
+        }
+
+        var transactions = await GetAccountTransactionInfos(versionAccounts);
+
+        return new BatchAccountTransactions(transactions, nextPage);
+    }
+
+
+    public async Task<BatchAccountTransactions> GetAccountTransactionsBatch(
+        TransactionsBatchPageRequest request, Gateway.LedgerState ledgerState)
+    {
+        List<string> addresses = new List<string>();
+        foreach (var account in request.AccountAddresses)
+        {
+            addresses.Add(account.Address);
+        }
+
+        // we reuse `NextPageAtAndBelowStateVersion` but the next page is actually above that version
+        var stateVersionLowerBound = request.Cursor?.NextPageAtAndBelowStateVersion ?? request.SinceState!._Version;
+        var stateVersionUpperBound = ledgerState._Version;
+
+        var ledgerTransactionVersions = await _dbContext.AccountTransactions
+            .Where(at =>
+                addresses.Contains(at.Account.Address)
+                && at.ResultantStateVersion > stateVersionLowerBound
+                && at.ResultantStateVersion <= stateVersionUpperBound
+                && !at.LedgerTransaction.IsStartOfEpoch
+            )
+            .GroupBy(at => at.ResultantStateVersion)
+            .OrderBy(grouping => grouping.Key)
+            .Take(request.PageSize + 1)
+            .Select(grouping => new QueryResult<long, IEnumerable<string>>(grouping.Key, grouping.Select(g => g.Account.Address)))
+            .ToListAsync();
+
+        int limit = request.PageSize;
+
+        Dictionary<long, IEnumerable<string>> versionAccounts = new Dictionary<long, IEnumerable<string>>();
+        CommittedTransactionPaginationCursor? nextPage = null;
+        for (int i = 0; i < ledgerTransactionVersions.Count; i++)
+        {
+            if (i == limit)
+            {
+                nextPage = new CommittedTransactionPaginationCursor(ledgerTransactionVersions[i - 1].t1);
+                break;
+            }
+
+            var ledgerTransactionV = ledgerTransactionVersions[i];
+            versionAccounts.Add(ledgerTransactionV.t1, ledgerTransactionV.t2);
+        }
+
+        var transactions = await GetAccountTransactionInfos(versionAccounts);
+
+        return new BatchAccountTransactions(transactions, nextPage);
     }
 
     public async Task<Gateway.TransactionInfo?> LookupCommittedTransaction(
@@ -307,6 +477,41 @@ public class TransactionQuerier : ITransactionQuerier
 
         return gatewayTransactions;
     }
+
+    private async Task<List<Gateway.AccountTransactionInfo>> GetAccountTransactionInfos(Dictionary<long, IEnumerable<string>> versionAccounts)
+    {
+        var transactionStateVersions = versionAccounts.Keys.ToList();
+        // same as GetTransactions() but order asc
+        var transactionWithOperationGroups = await _dbContext.LedgerTransactions
+            .Where(t => transactionStateVersions.Contains(t.ResultantStateVersion))
+            .Include(t => t.SubstantiveOperationGroups)
+            .ThenInclude(op => op.InferredAction!.Resource)
+            .Include(t => t.SubstantiveOperationGroups) // https://stackoverflow.com/a/50898208
+            .ThenInclude(op => op.InferredAction!.Validator)
+            .Include(t => t.SubstantiveOperationGroups) // https://stackoverflow.com/a/50898208
+            .ThenInclude(op => op.InferredAction!.FromAccount)
+            .Include(t => t.SubstantiveOperationGroups) // https://stackoverflow.com/a/50898208
+            .ThenInclude(op => op.InferredAction!.ToAccount)
+            .Include(t => t.RawTransaction)
+            .OrderBy(lt => lt.ResultantStateVersion)
+            .AsSplitQuery() // See https://docs.microsoft.com/en-us/ef/core/querying/single-split-queries
+            .ToListAsync();
+
+        var transactions = new List<Gateway.AccountTransactionInfo>();
+        foreach (var ledgerTransaction in transactionWithOperationGroups)
+        {
+            var transactionInfo = await MapToGatewayAccountTransaction(ledgerTransaction);
+            var accountIds = versionAccounts[ledgerTransaction.ResultantStateVersion];
+            foreach (var account in accountIds)
+            {
+                var accId = new Gateway.AccountIdentifier(account);
+                transactions.Add(new Gateway.AccountTransactionInfo(accId, transactionInfo));
+            }
+        }
+
+        return transactions;
+    }
+
 
     private async Task<Gateway.TransactionInfo> MapToGatewayAccountTransaction(LedgerTransaction ledgerTransaction)
     {
