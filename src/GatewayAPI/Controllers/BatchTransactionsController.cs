@@ -63,6 +63,7 @@
  */
 
 using GatewayAPI.ApiSurface;
+using GatewayAPI.Configuration;
 using GatewayAPI.Database;
 using GatewayAPI.Exceptions;
 using Microsoft.AspNetCore.Mvc;
@@ -77,16 +78,19 @@ public class BatchTransactionsController : ControllerBase
     private readonly IValidations _validations;
     private readonly ILedgerStateQuerier _ledgerStateQuerier;
     private readonly ITransactionQuerier _transactionQuerier;
+    private readonly IGatewayApiConfiguration _gatewayApiConfiguration;
 
     public BatchTransactionsController(
         IValidations validations,
         ILedgerStateQuerier ledgerStateQuerier,
-        ITransactionQuerier transactionQuerier
+        ITransactionQuerier transactionQuerier,
+        IGatewayApiConfiguration gatewayApiConfiguration
     )
     {
         _validations = validations;
         _ledgerStateQuerier = ledgerStateQuerier;
         _transactionQuerier = transactionQuerier;
+        _gatewayApiConfiguration = gatewayApiConfiguration;
     }
 
     [HttpPost("since-account-transactions")]
@@ -115,7 +119,7 @@ public class BatchTransactionsController : ControllerBase
             "Limit",
             unvalidatedLimit,
             1,
-            100
+            _gatewayApiConfiguration.GetMaxPageSize()
         );
 
         var results =
@@ -157,7 +161,7 @@ public class BatchTransactionsController : ControllerBase
                 "Page size",
                 unvalidatedLimit,
                 1,
-                100
+                _gatewayApiConfiguration.GetMaxPageSize()
             )
         );
 
