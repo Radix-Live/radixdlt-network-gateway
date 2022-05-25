@@ -1738,10 +1738,8 @@ components:
         network_identifier:
           network: mainnet
         account_identifiers:
-          - account_identifier:
-              address: rdx1qsp000000000000000000000000000000000000000000000000000q9c0gvj
-          - account_identifier:
-              address: rdx1qsprl50r77hg759ccamph85n7fxfvdjwmvmywy867cgr4nermmtcw7q32velj
+          - address: rdx1qsp000000000000000000000000000000000000000000000000000q9c0gvj
+          - address: rdx1qsprl50r77hg759ccamph85n7fxfvdjwmvmywy867cgr4nermmtcw7q32velj
         since_state_identifier:
           version: 1234567
         limit: 30
