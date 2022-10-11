@@ -1,6 +1,6 @@
 openapi: 3.0.0
 info:
-  version: 1.1.4
+  version: 1.1.4.1-L
   title: Radix Gateway API
   license:
     name: The Radix License, Version 1.0
@@ -19,6 +19,8 @@ info:
     * `/token/*` - To query token-related information
     * `/validator/*` and `/validators` - To query validator-related information
     * `/transaction/*` - To build, finalize and submit transactions, and to read the status and content of submitted and on-ledger transactions.
+    * `/custom/*` - Additional endpoints that are an unofficial extensions to the Gateway API and available only at some API providers (e.g. `https://radix.live`),
+              or as a custom build from a [forked repository](https://github.com/Radix-Live/radixdlt-network-gateway)
 
     The Gateway API is implemented by the [Network Gateway](https://github.com/radixdlt/radixdlt-network-gateway), which is configured to read from full node/s to extract and index data from the network.
 
@@ -61,6 +63,9 @@ tags:
   - name: Transaction
     x-displayName: Transaction Endpoints
     description: To build, finalize and submit transactions, and to query transaction status and contents.
+  - name: Custom Endpoints
+    x-displayName: Custom (Additional) Endpoints
+    description: Additional endpoints that are an unofficial extensions to the Gateway API and available only at some API providers.
 paths:
   "/gateway":
     post:
@@ -555,6 +560,80 @@ paths:
             application/json:
               schema:
                 "$ref": "#/components/schemas/ErrorResponse"
+  "/custom/transactions-batch/since-account-transactions":
+    post:
+      summary: Batch Polling of new Transactions
+      description: |
+        Returns a list of transactions for each of the requested accounts, that were committed after the requested transaction hash.<br>
+        The transactions are grouped by accounts and ordered by date (oldest first).<br>
+        The pagination is not supported; the clients are expected to perform a new request with updated last seen transaction hashes.<br>
+        If there are no new transactions for one of the specified accounts - it will be omitted from the response.<br>
+        If there are no new transactions for all of the specified accounts - the endpoint will return a successful response with an empty list of AccountTransactions.<br>
+        If there is a transaction that is related to two or more requested accounts - it will be included in the response multiple times - once per each related account.<br>
+        A typical use usage scenario:
+        1. Execute the request for a list of accounts, without specifying the TX hashes in the request
+        2. Process the received transactions, store the last seen transaction for each monitored account
+        3. Execute a new request, this time supply the last seen transaction hashes in the request
+        4. Process the received transactions, store the last seen transaction for each monitored account
+        5. Repeat #3-#4 while received TX count == limit
+        6. After some interval (1-5 minutes) - goto #3.
+      tags:
+        - Batch Transactions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/TransactionsSinceHashBatchRequest"
+      responses:
+        '200':
+          description: The oldest transactions that match the criteria
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/TransactionsSinceHashBatchResponse"
+        '500':
+          description: Gateway Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
+  "/custom/transactions-batch/since-ledger-state":
+    post:
+      summary: Batch request transactions for multiple accounts.
+      description: |
+        Returns a list of transactions for each of the requested accounts, that were committed after the requested historical ledger state.<br>
+        The transactions are returned in a paginated format, grouped by accounts and ordered by date (oldest first).<br>
+        To get the next page - execute a new request with the "cursor" object received in the response.<br>
+        If there are no transactions for one of the specified accounts - it will be omitted from the response.<br>
+        If there are no transactions for all of the specified accounts - the endpoint will still return a successful response with an empty list of AccountTransactions.<br>
+        If there is a transaction that is related to two or more requested accounts - it will be included in the response multiple times - once per each related account.<br>
+
+        `since_state_identifier` - Transactions from this or any earlier state versions will not be included into the response.<br>
+        `at_state_identifier` - The most recent state version to include (inclusive). Optional, by default the most recent observed state will be used.<br>
+        `cursor` - The value from the previous page request. If set, overrides `since_state_identifier` param.<br>
+        One of [`since_state_identifier`, `cursor`] is required.
+      tags:
+        - Batch Transactions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/TransactionsSinceStateBatchRequest"
+      responses:
+        '200':
+          description: The oldest transactions that match the criteria
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/TransactionsSinceStateBatchResponse"
+        '500':
+          description: Gateway Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
 components:
   schemas:
     AccountBalancesRequest:
@@ -698,6 +777,30 @@ components:
             The number of epochs until the XRD in this unstake will be released back to the account. This delay is to enable stake to be slashed, if the validator misbehaves.
           type: integer
           format: int64
+    AccountTransactionInfo:
+      type: object
+      required:
+        - account_identifier
+        - transaction
+      properties:
+        account_identifier:
+          $ref: "#/components/schemas/AccountIdentifier"
+        transaction:
+          $ref: "#/components/schemas/TransactionInfo"
+    AccountTransactionPair:
+      type: object
+      required:
+        - account_identifier
+      properties:
+        account_identifier:
+          $ref: "#/components/schemas/AccountIdentifier"
+        transaction_identifier:
+          $ref: "#/components/schemas/TransactionIdentifier"
+      example:
+        account_identifier:
+          address: rdx1qsprl50r77hg759ccamph85n7fxfvdjwmvmywy867cgr4nermmtcw7q32velj
+        transaction_identifier:
+          hash: 346e1ec8100dcfd916efb6426c7393388173863c804973d8409956cfd6a0079d
     AccountTransactionsRequest:
       type: object
       required:
@@ -1566,6 +1669,100 @@ components:
           description: The last epoch considered (inclusive).
           type: integer
           format: int64
+    TransactionsSinceHashBatchRequest:
+      type: object
+      required:
+        - network_identifier
+        - since_account_transactions
+      properties:
+        network_identifier:
+          $ref: "#/components/schemas/NetworkIdentifier"
+        since_account_transactions:
+          description:
+            "A list of up to 100 pairs: [ account, last seen transaction identifier(optional) ]."
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountTransactionPair"
+        limit:
+          description: The number of transactions to return. The maximum value is 100. Default - 30.
+          type: integer
+      example:
+        network_identifier:
+          network: mainnet
+        since_account_transactions:
+          - account_identifier:
+              address: rdx1qsp000000000000000000000000000000000000000000000000000q9c0gvj
+          - account_identifier:
+              address: rdx1qsprl50r77hg759ccamph85n7fxfvdjwmvmywy867cgr4nermmtcw7q32velj
+            transaction_identifier:
+              hash: 346e1ec8100dcfd916efb6426c7393388173863c804973d8409956cfd6a0079d
+        limit: 30
+    TransactionsSinceHashBatchResponse:
+      type: object
+      required:
+        - ledger_state
+        - account_transactions
+        - has_more
+      properties:
+        ledger_state:
+          $ref: "#/components/schemas/LedgerState"
+        account_transactions:
+          description: The oldest transactions that match the criteria.
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountTransactionInfo"
+        has_more:
+          description: true if there are more transactions at the current state version for given accounts
+          type: boolean
+    TransactionsSinceStateBatchRequest:
+      type: object
+      required:
+        - network_identifier
+        - account_identifiers
+      properties:
+        network_identifier:
+          $ref: "#/components/schemas/NetworkIdentifier"
+        account_identifiers:
+          description:
+            "A list of up to 100 accounts to check."
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountIdentifier"
+        since_state_identifier:
+          $ref: "#/components/schemas/PartialLedgerStateIdentifier"
+        at_state_identifier:
+          $ref: "#/components/schemas/PartialLedgerStateIdentifier"
+        cursor:
+          description: This cursor allows forward pagination, by providing the cursor from the previous request.
+          type: string
+        limit:
+          description: The page size requested. The maximum value is 100. Default - 30.
+          type: integer
+      example:
+        network_identifier:
+          network: mainnet
+        account_identifiers:
+          - address: rdx1qsp000000000000000000000000000000000000000000000000000q9c0gvj
+          - address: rdx1qsprl50r77hg759ccamph85n7fxfvdjwmvmywy867cgr4nermmtcw7q32velj
+        since_state_identifier:
+          version: 1234567
+        limit: 30
+    TransactionsSinceStateBatchResponse:
+      type: object
+      required:
+        - ledger_state
+        - account_transactions
+      properties:
+        ledger_state:
+          $ref: "#/components/schemas/LedgerState"
+        next_cursor:
+          description: The cursor to be provided with a new request, to get the next page of results. If missing, this is the last page of results.
+          type: string
+        account_transactions:
+          description: The page of the oldest transactions that match the criteria.
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountTransactionInfo"
     Token:
       type: object
       required:
@@ -1737,6 +1934,7 @@ components:
       properties:
         address:
           description: The radix address of the account.
+          pattern: "^rdx1[02-9AC-HJ-NP-Zac-hj-np-z]{54}[cgqsCGQS]{1}[02-9AC-HJ-NP-Zac-hj-np-z]{6}$"
           type: string
     ValidatorIdentifier:
       type: object
