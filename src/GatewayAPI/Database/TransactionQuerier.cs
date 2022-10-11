@@ -325,8 +325,7 @@ public class TransactionQuerier : ITransactionQuerier
             addresses.Add(account.Address);
         }
 
-        // we reuse `NextPageAtAndBelowStateVersion` but the next page is actually above that version
-        var stateVersionLowerBound = request.Cursor?.NextPageAtAndBelowStateVersion ?? request.SinceState!._Version;
+        var stateVersionLowerBound = request.Cursor?.StateVersionBoundary ?? request.SinceState!._Version;
         var stateVersionUpperBound = ledgerState._Version;
 
         var ledgerTransactionVersions = await _dbContext.AccountTransactions
