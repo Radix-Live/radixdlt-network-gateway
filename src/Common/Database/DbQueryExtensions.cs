@@ -112,6 +112,7 @@ public static class DbQueryExtensions
         where TDbContext : CommonDbContext
     {
         return dbContext.LedgerStatus
+            .OrderBy(l => l.Id) // Improves query plan against mainnet-magnitude data
             .Select(lt => lt.TopOfLedgerTransaction);
     }
 
@@ -136,21 +137,45 @@ public static class DbQueryExtensions
     public static IQueryable<LedgerTransaction> GetLatestLedgerTransactionBeforeTimestamp<TDbContext>(this TDbContext dbContext, Instant timestamp)
         where TDbContext : CommonDbContext
     {
+        // we're using bit odd query rather simple ORDER BY round_timestamp, state_version as Postgres fails to use index on round_timestamp column otherwise
         return dbContext.LedgerTransactions
-            .Where(lt => lt.RoundTimestamp <= timestamp)
-            .OrderByDescending(lt => lt.RoundTimestamp)
-            .ThenByDescending(lt => lt.ResultantStateVersion)
-            .Take(1);
+            .FromSqlInterpolated($@"
+WITH previous_timestamp AS (
+    SELECT l.round_timestamp
+    FROM ledger_transactions AS l
+    WHERE l.round_timestamp <= {timestamp}
+    ORDER BY l.round_timestamp DESC
+    LIMIT 1
+)
+SELECT l.*
+FROM previous_timestamp AS pt
+CROSS JOIN ledger_transactions AS l
+WHERE l.round_timestamp = pt.round_timestamp
+ORDER BY l.state_version DESC
+LIMIT 1
+");
     }
 
     public static IQueryable<LedgerTransaction> GetFirstLedgerTransactionAfterTimestamp<TDbContext>(this TDbContext dbContext, Instant timestamp)
         where TDbContext : CommonDbContext
     {
+        // we're using bit odd query rather simple ORDER BY round_timestamp, state_version as Postgres fails to use index on round_timestamp column otherwise
         return dbContext.LedgerTransactions
-            .Where(lt => lt.RoundTimestamp >= timestamp)
-            .OrderBy(lt => lt.RoundTimestamp)
-            .ThenBy(lt => lt.ResultantStateVersion)
-            .Take(1);
+                .FromSqlInterpolated($@"
+WITH next_timestamp AS (
+    SELECT round_timestamp
+    FROM ledger_transactions
+    WHERE round_timestamp >= {timestamp}
+    ORDER BY round_timestamp ASC
+    LIMIT 1
+)
+SELECT l.*
+FROM next_timestamp AS nt
+CROSS JOIN ledger_transactions AS l
+WHERE l.round_timestamp = nt.round_timestamp
+ORDER BY l.state_version ASC
+LIMIT 1
+");
     }
 
     public static IQueryable<LedgerTransaction> GetLatestLedgerTransactionAtEpochRound<TDbContext>(this TDbContext dbContext, long epoch, long round)
@@ -333,30 +358,6 @@ INNER JOIN LATERAL (
 	LIMIT 1
 ) h ON (true)
 ");
-    }
-
-    public static IQueryable<ValidatorStakeHistory> ValidatorStakeHistoryAtVersionForValidatorAddressesWithIncludedValidator<TDbContext>(
-        this TDbContext dbContext,
-        List<string> validatorAddresses,
-        long stateVersion
-    )
-        where TDbContext : CommonDbContext
-    {
-        return dbContext.Validators
-            .Where(v => validatorAddresses.Contains(v.Address) && v.FromStateVersion <= stateVersion)
-            .Select(v => v.Id)
-            .Select(validatorId =>
-                dbContext.Set<ValidatorStakeHistory>()
-                    .Where(h =>
-                        h.ValidatorId == validatorId
-                        && h.FromStateVersion <= stateVersion
-                    )
-                    .OrderByDescending(h => h.FromStateVersion)
-                    .Include(v => v.Validator)
-                    .FirstOrDefault()
-            )
-            .Where(vsh => vsh != null)
-            .Select(vsh => vsh!);
     }
 
     public static IQueryable<ValidatorStakeHistory> ValidatorStakeHistoryAtVersionForValidatorIds<TDbContext>(
